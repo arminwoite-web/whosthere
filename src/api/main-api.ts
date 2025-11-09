@@ -20,85 +20,85 @@ serve(async (req) => {
         global: {
           headers: { Authorization: req.headers.get('Authorization')! },
         },
-      }
+      },
     );
 
-    const { user } = await supabaseClient.auth.getUser();
-    if (!user) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
+    const { url, method } = req;
+    const path = new URL(url).pathname;
 
-    const url = new URL(req.url);
-    const path = url.pathname;
+    switch (path) {
+      case '/api/sendMessage': {
+        if (method !== 'POST') {
+          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
 
-    // POST /api/messages
-    if (req.method === 'POST' && path === '/api/messages') {
-      const { chat_id, receiver_id, content } = await req.json();
+        const { senderId, chatId, content } = await req.json();
 
-      if (!chat_id || !receiver_id || !content) {
-        return new Response(JSON.stringify({ error: 'Missing required fields: chat_id, receiver_id, content' }), {
-          status: 400,
+        if (!senderId || !chatId || !content) {
+          return new Response(JSON.stringify({ error: 'Missing required fields: senderId, chatId, content' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        // 1. Nachricht in 'messages' Tabelle speichern
+        const { data: message, error: messageError } = await supabaseClient
+          .from('messages')
+          .insert({ chat_id: chatId, sender_id: senderId, content: content })
+          .select('id, timestamp')
+          .single();
+
+        if (messageError) throw messageError;
+
+        // 2. Chat-Teilnehmer abrufen
+        const { data: chatParticipants, error: participantsError } = await supabaseClient
+          .from('chat_participants')
+          .select('user_id')
+          .eq('chat_id', chatId);
+
+        if (participantsError) throw participantsError;
+
+        // 3. Lesestatus für jeden Teilnehmer in 'message_read_status' erstellen
+        const readStatusEntries = chatParticipants.map((participant) => ({
+          message_id: message.id,
+          user_id: participant.user_id,
+          is_read: participant.user_id === senderId, // Absender hat die Nachricht sofort gelesen
+        }));
+
+        const { error: readStatusError } = await supabaseClient
+          .from('message_read_status')
+          .insert(readStatusEntries);
+
+        if (readStatusError) throw readStatusError;
+
+        return new Response(JSON.stringify({ messageId: message.id, timestamp: message.timestamp }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
 
-      const { data: message, error } = await supabaseClient
-        .from('messages')
-        .insert({ chat_id, sender_id: user.id, content })
-        .select()
-        .single();
+      case '/api/markMessagesAsRead': {
+        if (method !== 'POST') {
+          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
 
-      if (error) throw error;
+        const { userId, messageIds } = await req.json();
 
-      // Mark message as read for the sender
-      await supabaseClient
-        .from('message_reads')
-        .insert({ message_id: message.id, user_id: user.id });
+        if (!userId || !Array.isArray(messageIds) || messageIds.length === 0) {
+          return new Response(JSON.stringify({ error: 'Missing required fields: userId, messageIds (array)' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
 
-      return new Response(JSON.stringify({ message_id: message.id, timestamp: message.created_at }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // GET /api/messages?chat_id={chat_id}&limit={limit}&offset={offset}
-    if (req.method === 'GET' && path === '/api/messages') {
-      const chat_id = url.searchParams.get('chat_id');
-      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-      const offset = parseInt(url.searchParams.get('offset') || '0', 10);
-
-      if (!chat_id) {
-        return new Response(JSON.stringify({ error: 'Missing chat_id parameter' }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-
-      const { data: messages, error } = await supabaseClient
-        .from('messages')
-        .select(`
-          id,
-          sender_id,
-          content,
-          created_at,
-          message_reads!left(
-            user_id
-          )
-        `)
-        .eq('chat_id', chat_id)
-        .order('created_at', { ascending: true })
-        .range(offset, offset + limit - 1);
-
-      if (error) throw error;
-
-      const formattedMessages = messages.map(msg => ({
-        message_id: msg.id,
-        sender_id: msg.sender_id,
-        content: msg.content,
-        timestamp: msg.created_at,
-        is_read: msg.message_reads.some((read: { user_id: string }) => read.user_id === user.id),
-      }));
-
-      return new Response(JSON.stringify(formatted
+        const { count, error } = await supabaseClient
+          .from('message_read_status')
+          .update({ is_read: true })
+          .eq('user_id', userId)
+          .in('message_id', messageIds)
+          .select('*', { count

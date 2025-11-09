@@ -1,6 +1,6 @@
 ```typescript
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -15,90 +15,89 @@ serve(async (req) => {
   try {
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
-      {
+      Deno.env.get('SUPABASE_ANON_KEY') ?? '', {
         global: {
           headers: { Authorization: req.headers.get('Authorization')! },
         },
-      },
+      }
     );
 
     const { url, method } = req;
     const path = new URL(url).pathname;
 
-    switch (path) {
-      case '/api/sendMessage': {
-        if (method !== 'POST') {
-          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
-            status: 405,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
+    // POST /api/messages
+    if (path === '/api/messages' && method === 'POST') {
+      const { chat_room_id, sender_id, content } = await req.json();
 
-        const { senderId, chatId, content } = await req.json();
+      const { data, error } = await supabaseClient
+        .from('messages')
+        .insert([{ chat_room_id, sender_id, content }])
+        .select()
+        .single();
 
-        if (!senderId || !chatId || !content) {
-          return new Response(JSON.stringify({ error: 'Missing required fields: senderId, chatId, content' }), {
-            status: 400,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
+      if (error) throw error;
 
-        // 1. Nachricht in 'messages' Tabelle speichern
-        const { data: message, error: messageError } = await supabaseClient
-          .from('messages')
-          .insert({ chat_id: chatId, sender_id: senderId, content: content })
-          .select('id, timestamp')
-          .single();
+      return new Response(JSON.stringify(data), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 201,
+      });
+    }
 
-        if (messageError) throw messageError;
-
-        // 2. Chat-Teilnehmer abrufen
-        const { data: chatParticipants, error: participantsError } = await supabaseClient
-          .from('chat_participants')
-          .select('user_id')
-          .eq('chat_id', chatId);
-
-        if (participantsError) throw participantsError;
-
-        // 3. Lesestatus für jeden Teilnehmer in 'message_read_status' erstellen
-        const readStatusEntries = chatParticipants.map((participant) => ({
-          message_id: message.id,
-          user_id: participant.user_id,
-          is_read: participant.user_id === senderId, // Absender hat die Nachricht sofort gelesen
-        }));
-
-        const { error: readStatusError } = await supabaseClient
-          .from('message_read_status')
-          .insert(readStatusEntries);
-
-        if (readStatusError) throw readStatusError;
-
-        return new Response(JSON.stringify({ messageId: message.id, timestamp: message.timestamp }), {
+    // GET /api/messages/:chat_room_id
+    if (path.startsWith('/api/messages/') && method === 'GET') {
+      const chat_room_id = path.split('/').pop();
+      if (!chat_room_id) {
+        return new Response(JSON.stringify({ error: 'Chat room ID is required' }), {
+          status: 400,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
 
-      case '/api/markMessagesAsRead': {
-        if (method !== 'POST') {
-          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
-            status: 405,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
+      const { data, error } = await supabaseClient
+        .from('messages')
+        .select(`
+          *,
+          read_receipts(user_id)
+        `)
+        .eq('chat_room_id', chat_room_id)
+        .order('created_at', { ascending: true });
 
-        const { userId, messageIds } = await req.json();
+      if (error) throw error;
 
-        if (!userId || !Array.isArray(messageIds) || messageIds.length === 0) {
-          return new Response(JSON.stringify({ error: 'Missing required fields: userId, messageIds (array)' }), {
-            status: 400,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
+      // Transform data to include read_by array
+      const messagesWithReadBy = data.map(message => ({
+        ...message,
+        read_by: message.read_receipts.map((receipt: { user_id: string }) => receipt.user_id),
+        // Remove the original read_receipts array to clean up the response
+        read_receipts: undefined,
+      }));
 
-        const { count, error } = await supabaseClient
-          .from('message_read_status')
-          .update({ is_read: true })
-          .eq('user_id', userId)
-          .in('message_id', messageIds)
-          .select('*', { count
+      return new Response(JSON.stringify(messagesWithReadBy), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // POST /api/messages/:message_id/read
+    if (path.match(/\/api\/messages\/[^/]+\/read/) && method === 'POST') {
+      const message_id = path.split('/')[3];
+      if (!message_id) {
+        return new Response(JSON.stringify({ error: 'Message ID is required' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Get the authenticated user's ID
+      const { data: { user }, error: authError } = await supabaseClient.auth.getUser();
+      if (authError || !user) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      const user_id = user.id;
+
+      // Check if the read receipt already exists to prevent duplicates
+      const { data: existingReceipt, error: existingReceiptError } = await supabaseClient
+        .from('read_receipts')
+        .select('*')
